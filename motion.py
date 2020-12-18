@@ -1,4 +1,5 @@
 import time
+import uuid
 import json
 import datetime
 import RPi.GPIO as GPIO
@@ -9,51 +10,94 @@ from minio.error import S3Error
 import paho.mqtt.client as mqtt
 
 GPIO.setmode(GPIO.BCM)
-pirPin = 26
+
+PIR_PIN = 26
+VIDEO_TIME_SEC = 5
+BROKER_ADDRESS = "192.168.1.9"
+
+MINIO_HOST = "192.168.1.9:443"
+BUCKET_NAME = 'raspberrycamera'
+
+FILE_DIR = 'snapshots/'
 camera = picamera.PiCamera()
-GPIO.setup(pirPin, GPIO.IN)
+camera.resolution = 640,480
+GPIO.setup(PIR_PIN, GPIO.IN)
 
-brokerAddress = "192.168.0.17"
 mqttClient = mqtt.Client("P1")
-mqttClient.connect(brokerAddress)
+mqttClient.connect(BROKER_ADDRESS)
 
-imageDirectory = 'snapshots/'
 client = Minio(
-        "192.168.0.17:443",
+        MINIO_HOST,
         access_key="minio",
         secret_key="minio123",
         secure=False
     )
-bucketName = 'raspberrycamera'
-found = client.bucket_exists(bucketName)
+found = client.bucket_exists(BUCKET_NAME)
 if not found:
-    client.make_bucket(bucketName)
+    client.make_bucket(BUCKET_NAME)
 else:
-    print("Bucket 'raspberry_camera' already exists")
+    print("Bucket {} already exists".format(BUCKET_NAME))
+    
+def getDeviceId():
+    try:
+        deviceUUIDFile  = open("device_uuid", "r")
+        deviceUUID = deviceUUIDFile.read()
+        print("Device UUID : " + deviceUUID)
+        return deviceUUID
+    except FileNotFoundError:
+        print("Configuring new UUID for this device...")
+        deviceUUIDFile = open("device_uuid", "w")
+        deviceUUID = str(uuid.uuid4())
+        print("Device UUID : " + deviceUUID)
+        deviceUUIDFile.write(deviceUUID)
+        return deviceUUID
+        
 
 
-def lights():
-    print("Motion Detected!")
-    time.sleep(2)
+def record(filename):
+    print("Recording : " + filename)
+    camera.start_recording(filename)
+    camera.wait_recording(VIDEO_TIME_SEC)
+    camera.stop_recording()
+    print("Recorded")
 
-print('Motion sensor alarm')
+
+def sendToMinio(filename):
+    try:
+        print("Sending to minio")
+        client.fput_object(
+            BUCKET_NAME, filename, FILE_DIR + filename
+        )
+        print("Video has been sent")
+    except Exception:
+        print("Couldn't send to Minio")
+
+
 time.sleep(2)
-print('Ready')
+deviceUUID = getDeviceId()
+print('Ready. Device ID : {}'.format(deviceUUID))
 
 try:
     while True:
         ts = time.time()
         st = datetime.datetime.fromtimestamp(ts).strftime('%d.%m.%Y %H:%M:%S')
-        if GPIO.input(pirPin):
+        if GPIO.input(PIR_PIN):
             time.sleep(0.5)
             print("Motion Detected... Sending to MQTT")
-            message = json.dumps({'place': 'office_room', 'alarm_type': 'detected_motion', 'occured_at': st}, sort_keys=True)
+            alarmUUID = str(uuid.uuid4())
+            filename = '{}_alarm_{}.h264'.format(alarmUUID, st)
+            message = json.dumps({
+                                    'device_id': deviceUUID,
+                                    'id': alarmUUID,
+                                    'place': 'office_room',
+                                    'filename': filename,
+                                    'type': 'detected_motion',
+                                    'occurred_at': st
+                                    }, sort_keys=True)
             mqttClient.publish("raspberry/main", message)
-            imageName = 'alarm_{}.jpg'.format(st)
-            camera.capture(imageDirectory + imageName)
-            client.fput_object(
-                bucketName, "imageName", imageDirectory + imageName,
-            )
+            record(FILE_DIR + filename)
+            sendToMinio(filename)
+            
             time.sleep(3)
         time.sleep(0.1)
         
